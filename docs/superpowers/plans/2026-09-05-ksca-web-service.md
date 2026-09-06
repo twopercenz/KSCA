@@ -14,6 +14,12 @@
 
 README §3.1 lists an upload field for author name(s) ("저자명(본인 + 공동저자 텍스트 입력)"), but the "최종본" (final) schema in §8 has no column for it — only `author_id` (the uploader). Rather than silently dropping the described field or silently contradicting the "final" schema, this plan adds one additive migration: `alter table papers add column authors text not null default ''`. README's own SQL blocks are otherwise copied verbatim into migrations for traceability.
 
+**Found during pre-flight review (before any task was dispatched):** README §10's `check_report_threshold()` trigger has no `security definer`, unlike `generate_concept_id()` in §9 which does. As written, the trigger runs with the privileges of whoever's `INSERT` on `reports` fired it — an ordinary reporting user, via PostgREST's `authenticated` role, under RLS. That reporting user is essentially never the content's author or an admin, so the trigger's own `update papers ... / update posts ...` would be silently blocked by `papers_update_own_or_admin` / `posts_update_own_or_admin` for everyone except the rare case where the 3rd reporter happens to be the author or an admin. For `comments` and `paper_comments`, README §12 defines no `update` policy at all — so the trigger's updates to those two tables would be rejected by RLS regardless of who triggered it. §2 Task 2's manual smoke test (Task 2 Step 9) ran via `supabase db psql`, i.e. as the Postgres superuser, which bypasses RLS entirely — it could not have caught this, and did not.
+
+Additionally, Task 18's admin confirm/restore action needs to `update` `comments` and `paper_comments` under the requesting admin's own session (the regular server client, not service-role) — and hits the same missing-policy gap independent of the trigger issue above.
+
+**Ruling:** add `security definer set search_path = public` to `check_report_threshold()` (mirroring the pattern README's own §9 function already establishes — same technique, same file, no new concept), and add two admin-only `update` policies for `comments` and `paper_comments` (mirroring the existing `reports_update_admin_only` pattern). Both are additive; no README-specified column, policy, or documented behavior is removed or contradicted — this is what makes the documented "3건 누적 시 자동 비공개" and "운영진이 최종 삭제 확정 또는 복구" behaviors (§3.5, §11) actually reachable for all four `target_type`s. Folded into Task 2 (migration `0006_report_target_update_policies.sql`) below; Task 18's dispatch brief will note the dependency.
+
 ## Global Constraints
 
 - File uploads: PDF only, 20MB max (README §3.1).
@@ -225,6 +231,7 @@ Claude-Session: https://claude.ai/code/session_015YKV338BjchJuG3ScaBKXh"
 - Create: `supabase/migrations/0003_profile_on_signup.sql`
 - Create: `supabase/migrations/0004_functions_triggers.sql`
 - Create: `supabase/migrations/0005_rls.sql`
+- Create: `supabase/migrations/0006_report_target_update_policies.sql`
 
 **Interfaces:**
 - Produces: every table/column/function/trigger/policy that all later Server Actions and pages query against. This is the contract every later task's Supabase calls rely on.
@@ -355,7 +362,9 @@ after insert on auth.users
 for each row execute function public.handle_new_user();
 ```
 
-- [ ] **Step 5: Write `supabase/migrations/0004_functions_triggers.sql` (README §9-10, verbatim)**
+- [ ] **Step 5: Write `supabase/migrations/0004_functions_triggers.sql` (README §9-10, with one documented addition — see "Found during pre-flight review" above)**
+
+`generate_concept_id()` is verbatim README §9. `check_report_threshold()` is README §10's logic with `security definer set search_path = public` added to its declaration (the two lines marked below) — without it, the trigger runs as the reporting user and gets blocked by the very RLS policies this migration installs, for every target type, for almost every reporter. This changes no business logic, only who the trigger runs as.
 
 ```sql
 create or replace function generate_concept_id()
@@ -383,6 +392,8 @@ $$;
 create or replace function check_report_threshold()
 returns trigger
 language plpgsql
+security definer -- added: see pre-flight note above the Files list
+set search_path = public -- added: see pre-flight note above the Files list
 as $$
 declare
   report_count int;
@@ -489,15 +500,27 @@ create policy "reports_update_admin_only" on reports for update
 create policy "paper_counters_no_direct_access" on paper_counters for all using (false);
 ```
 
-- [ ] **Step 7: Apply the migrations**
+- [ ] **Step 7: Write `supabase/migrations/0006_report_target_update_policies.sql` (documented addition — see pre-flight note above)**
+
+README §12 defines `update` policies for `papers` and `posts` but none for `comments` or `paper_comments`. Task 18's admin confirm/restore action needs to `update` those two tables' `status` under the admin's own session (not service-role), so it needs the same admin-only `update` access `reports_update_admin_only` already establishes for `reports`.
+
+```sql
+create policy "comments_update_admin_only" on comments for update
+  using (exists (select 1 from profiles where id = auth.uid() and role = 'admin'));
+
+create policy "paper_comments_update_admin_only" on paper_comments for update
+  using (exists (select 1 from profiles where id = auth.uid() and role = 'admin'));
+```
+
+- [ ] **Step 8: Apply the migrations**
 
 ```bash
 npx supabase db reset
 ```
 
-Expected: all 5 migrations apply cleanly with no errors.
+Expected: all 6 migrations apply cleanly with no errors.
 
-- [ ] **Step 8: Verify `generate_concept_id()` issues sequential ids**
+- [ ] **Step 9: Verify `generate_concept_id()` issues sequential ids**
 
 ```bash
 npx supabase db psql -c "select generate_concept_id(); select generate_concept_id();"
@@ -505,7 +528,7 @@ npx supabase db psql -c "select generate_concept_id(); select generate_concept_i
 
 Expected: two rows like `KSCA-2026-000001` then `KSCA-2026-000002`.
 
-- [ ] **Step 9: Verify the report-threshold trigger for the `paper` target type**
+- [ ] **Step 10: Verify the report-threshold trigger fires structurally for the `paper` target type**
 
 ```bash
 npx supabase db psql <<'SQL'
@@ -540,9 +563,9 @@ end $$;
 SQL
 ```
 
-Expected: `NOTICE: trigger test passed` with no assertion error. This is a manual smoke check now; Task 19 covers all four target types systematically.
+Expected: `NOTICE: trigger test passed` with no assertion error. **This runs as the Postgres superuser (`supabase db psql`), which bypasses RLS entirely** — it proves the trigger's own logic is correct but cannot catch an RLS/privilege regression (e.g. someone removing `security definer` from `check_report_threshold()`). Task 20's `report_threshold_check.sql` closes that gap by running the same scenario as the `authenticated` role impersonating an ordinary reporter — treat Task 20 as the real regression guard for this trigger, not this step.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add supabase
@@ -1990,11 +2013,14 @@ export function CitationBlock({ paper }: { paper: CitationInput }) {
 
 - [ ] **Step 6: Write `app/papers/[concept_id]/page.tsx`** (latest version; renders comments/report button as placeholders wired in Tasks 12-13)
 
+**Found during pre-flight review:** incrementing `view_count` on every visit must succeed for anonymous and other-user visitors too (README §3.3's "조회수순" sort depends on it), but `papers_update_own_or_admin` (README §12, verbatim) only lets the author or an admin update a `papers` row — a plain visitor's `update` would be silently blocked by RLS (0 rows affected, no error). This uses `createAdminClient()` (Task 4) for the increment specifically, the same service-role client already used for signed URLs — the visibility check just above still runs through the regular session-aware client, so a visitor who can't see a hidden paper never reaches the increment at all.
+
 ```tsx
 // app/papers/[concept_id]/page.tsx
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
+import { createAdminClient } from '@/lib/supabase/admin';
 import { canView } from '@/lib/visibility';
 import { CitationBlock } from '@/components/CitationBlock';
 import { VersionBadge } from '@/components/VersionBadge';
@@ -2019,7 +2045,10 @@ export default async function PaperDetailPage({ params }: { params: Promise<{ co
   const latest = versions[0];
   if (!canView(latest, user?.id ?? null, role)) notFound();
 
-  await supabase
+  // Service-role client: a plain visitor is neither the author nor an admin,
+  // so this would be blocked by papers_update_own_or_admin on the regular
+  // session client (see the pre-flight note above).
+  await createAdminClient()
     .from('papers')
     .update({ view_count: latest.view_count + 1 })
     .eq('id', latest.id);
@@ -2159,7 +2188,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
 - [ ] **Step 9: Manual verification**
 
-Run: `npm run dev`. Visit `/papers/<seeded multi-version concept_id>` — confirm both APA/BibTeX render and copy, version history lists v1/v2 with v2 shown as current, `/papers/<concept_id>/v/1` shows the old abstract, and the PDF download link resolves (redirects to a signed URL that serves the placeholder PDF from Task 3).
+Run: `npm run dev`. Visit `/papers/<seeded multi-version concept_id>` — confirm both APA/BibTeX render and copy, version history lists v1/v2 with v2 shown as current, `/papers/<concept_id>/v/1` shows the old abstract, and the PDF download link resolves (redirects to a signed URL that serves the placeholder PDF from Task 3). **While logged out (or as a user who isn't that paper's author)**, reload the detail page a couple of times and confirm `view_count` actually increases (`npx supabase db psql -c "select view_count from papers where concept_id = '<concept_id>' order by version_no desc limit 1;"`) — this is the specific case `papers_update_own_or_admin` would silently block without the admin-client fix above.
 
 - [ ] **Step 10: Commit**
 
@@ -3438,10 +3467,13 @@ Claude-Session: https://claude.ai/code/session_01YAV7S1ikQANDFtMMDEXDWi"
 **Interfaces:**
 - Consumes: `EmptyState` (created ad hoc in Task 10) — this task is where it gets its real, reusable shape and gets applied everywhere a list can be empty.
 
-- [ ] **Step 1: Write `supabase/tests/report_threshold_check.sql`** — Task 2 Step 9 checked only the `paper` case manually; this checks all four target types systematically.
+- [ ] **Step 1: Write `supabase/tests/report_threshold_check.sql`** — checks all four target types, and (unlike Task 2 Step 10's superuser smoke test) inserts the reports AS the reporting users under RLS, so it actually exercises the `security definer` fix from the pre-flight review. If that fix or migration 0006 ever regresses, this script — not Task 2 Step 10 — is what catches it.
 
 ```sql
 -- Run with: npx supabase db psql -f supabase/tests/report_threshold_check.sql
+-- Reports are inserted AS each reporting user (authenticated role, RLS
+-- applied) rather than as the superuser — this is the realistic path a
+-- real report submission through the app takes.
 do $$
 declare
   author uuid := gen_random_uuid();
@@ -3452,6 +3484,7 @@ declare
   post_id uuid;
   comment_id uuid;
   paper_comment_id uuid;
+  reporter uuid;
 begin
   insert into auth.users (id, email) values
     (author, 'threshold-author@example.com'),
@@ -3468,18 +3501,28 @@ begin
   insert into paper_comments (id, paper_id, author_id, content, written_at_version)
   values (gen_random_uuid(), paper_id, author, 'c', 1) returning id into paper_comment_id;
 
-  insert into reports (target_type, target_id, reporter_id, reason) values
-    ('paper', paper_id, r1, 'spam'), ('paper', paper_id, r2, 'spam'), ('paper', paper_id, r3, 'spam'),
-    ('post', post_id, r1, 'spam'), ('post', post_id, r2, 'spam'), ('post', post_id, r3, 'spam'),
-    ('comment', comment_id, r1, 'spam'), ('comment', comment_id, r2, 'spam'), ('comment', comment_id, r3, 'spam'),
-    ('paper_comment', paper_comment_id, r1, 'spam'), ('paper_comment', paper_comment_id, r2, 'spam'), ('paper_comment', paper_comment_id, r3, 'spam');
+  -- None of r1/r2/r3 is the author or an admin. If check_report_threshold()
+  -- ever loses its `security definer`, these inserts still succeed (reports
+  -- RLS allows any authenticated reporter) but the trigger's own updates to
+  -- papers/posts/comments/paper_comments would be silently blocked by RLS —
+  -- that's exactly the bug the pre-flight review found and this guards against.
+  set local role authenticated;
+  foreach reporter in array array[r1, r2, r3] loop
+    perform set_config('request.jwt.claims', json_build_object('sub', reporter)::text, true);
+    insert into reports (target_type, target_id, reporter_id, reason) values
+      ('paper', paper_id, reporter, 'spam'),
+      ('post', post_id, reporter, 'spam'),
+      ('comment', comment_id, reporter, 'spam'),
+      ('paper_comment', paper_comment_id, reporter, 'spam');
+  end loop;
+  reset role;
 
-  assert (select status from papers where id = paper_id) = 'hidden', 'paper should auto-hide at 3 reports';
-  assert (select status from posts where id = post_id) = 'hidden', 'post should auto-hide at 3 reports';
-  assert (select status from comments where id = comment_id) = 'hidden', 'comment should auto-hide at 3 reports';
-  assert (select status from paper_comments where id = paper_comment_id) = 'hidden', 'paper_comment should auto-hide at 3 reports';
+  assert (select status from papers where id = paper_id) = 'hidden', 'paper should auto-hide at 3 reports (as authenticated reporters)';
+  assert (select status from posts where id = post_id) = 'hidden', 'post should auto-hide at 3 reports (as authenticated reporters)';
+  assert (select status from comments where id = comment_id) = 'hidden', 'comment should auto-hide at 3 reports (as authenticated reporters)';
+  assert (select status from paper_comments where id = paper_comment_id) = 'hidden', 'paper_comment should auto-hide at 3 reports (as authenticated reporters)';
 
-  raise notice 'report_threshold_check.sql: all 4 target types passed';
+  raise notice 'report_threshold_check.sql: all 4 target types passed under RLS';
 end $$;
 ```
 
@@ -3489,7 +3532,7 @@ end $$;
 npx supabase db psql -f supabase/tests/report_threshold_check.sql
 ```
 
-Expected: `NOTICE: report_threshold_check.sql: all 4 target types passed`.
+Expected: `NOTICE: report_threshold_check.sql: all 4 target types passed under RLS`. If this fails with a permission/RLS error instead of the assertion message, the most likely cause is migration 0004's `security definer` on `check_report_threshold()` or migration 0006's two admin-only `update` policies — re-check both against Task 2 Steps 5 and 7 before assuming this script is wrong.
 
 - [ ] **Step 3: Firm up `components/EmptyState.tsx`**
 
