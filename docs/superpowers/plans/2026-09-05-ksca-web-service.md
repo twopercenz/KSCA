@@ -20,6 +20,10 @@ Additionally, Task 18's admin confirm/restore action needs to `update` `comments
 
 **Ruling:** add `security definer set search_path = public` to `check_report_threshold()` (mirroring the pattern README's own §9 function already establishes — same technique, same file, no new concept), and add two admin-only `update` policies for `comments` and `paper_comments` (mirroring the existing `reports_update_admin_only` pattern). Both are additive; no README-specified column, policy, or documented behavior is removed or contradicted — this is what makes the documented "3건 누적 시 자동 비공개" and "운영진이 최종 삭제 확정 또는 복구" behaviors (§3.5, §11) actually reachable for all four `target_type`s. Folded into Task 2 (migration `0006_report_target_update_policies.sql`) below; Task 18's dispatch brief will note the dependency.
 
+## Environment note (found while executing Task 2)
+
+The installed Supabase CLI (`supabase@2.116.0`) has **no `db psql` subcommand** — every `npx supabase db psql ...` in this plan's original text is wrong for this environment. Use `npx supabase db query --local -f <path>` in place of `db psql -f <path>`, and `npx supabase db query --local "<sql>"` in place of `db psql -c "<sql>"`. Verified behavior: a `select` returns JSON rows; an anonymous `do $$ ... $$` block that completes without error prints `DO` and exits 0 — that clean exit IS the pass signal; a failed `assert` inside the block surfaces as `{"_tag":"Error",...,"message":"<assert message>"}` with a non-zero exit code. `raise notice` text does **not** print through `db query` (unlike `psql`) — don't treat a missing `NOTICE: ... passed` line as a failure; a clean exit with JSON/`DO` output and no `_tag":"Error"` is success. If a future CLI version restores `db psql`, either form is fine; prefer whichever the installed CLI actually supports (`npx supabase db --help` shows the current subcommand list).
+
 ## Global Constraints
 
 - File uploads: PDF only, 20MB max (README §3.1).
@@ -523,15 +527,17 @@ Expected: all 6 migrations apply cleanly with no errors.
 - [ ] **Step 9: Verify `generate_concept_id()` issues sequential ids**
 
 ```bash
-npx supabase db psql -c "select generate_concept_id(); select generate_concept_id();"
+npx supabase db query --local "select generate_concept_id(); select generate_concept_id();"
 ```
 
 Expected: two rows like `KSCA-2026-000001` then `KSCA-2026-000002`.
 
 - [ ] **Step 10: Verify the report-threshold trigger fires structurally for the `paper` target type**
 
+Write this to a temp file and run it with `db query --local -f` (see the Environment note above — there is no `db psql` in this CLI):
+
 ```bash
-npx supabase db psql <<'SQL'
+cat > /tmp/trigtest.sql <<'SQL'
 do $$
 declare
   u1 uuid := gen_random_uuid();
@@ -561,9 +567,10 @@ begin
   raise notice 'trigger test passed';
 end $$;
 SQL
+npx supabase db query --local -f /tmp/trigtest.sql
 ```
 
-Expected: `NOTICE: trigger test passed` with no assertion error. **This runs as the Postgres superuser (`supabase db psql`), which bypasses RLS entirely** — it proves the trigger's own logic is correct but cannot catch an RLS/privilege regression (e.g. someone removing `security definer` from `check_report_threshold()`). Task 20's `report_threshold_check.sql` closes that gap by running the same scenario as the `authenticated` role impersonating an ordinary reporter — treat Task 20 as the real regression guard for this trigger, not this step.
+Expected: a clean exit printing `DO` (or `{}`/JSON with no `_tag":"Error"`), per the Environment note above — `raise notice` text will not appear even on success, that's expected, not a failure. **This runs as the Postgres superuser, which bypasses RLS entirely** — it proves the trigger's own logic is correct but cannot catch an RLS/privilege regression (e.g. someone removing `security definer` from `check_report_threshold()`). Task 20's `report_threshold_check.sql` closes that gap by running the same scenario as the `authenticated` role impersonating an ordinary reporter — treat Task 20 as the real regression guard for this trigger, not this step.
 
 - [ ] **Step 11: Commit**
 
@@ -696,7 +703,7 @@ rm -f "$PDF_PATH"
 - [ ] **Step 3: Create the private `papers` bucket, then apply seed + storage upload**
 
 ```bash
-npx supabase db psql -c "insert into storage.buckets (id, name, public) values ('papers', 'papers', false) on conflict (id) do nothing;"
+npx supabase db query --local "insert into storage.buckets (id, name, public) values ('papers', 'papers', false) on conflict (id) do nothing;"
 npx supabase db reset
 chmod +x supabase/seed-storage.sh
 ./supabase/seed-storage.sh
@@ -707,8 +714,8 @@ Expected: `uploaded seed/...pdf` printed 3 times with no curl errors.
 - [ ] **Step 4: Verify seeded data is queryable**
 
 ```bash
-npx supabase db psql -c "select concept_id, version_no, title from papers order by concept_id, version_no;"
-npx supabase db psql -c "select category, title from posts order by category;"
+npx supabase db query --local "select concept_id, version_no, title from papers order by concept_id, version_no;"
+npx supabase db query --local "select category, title from posts order by category;"
 ```
 
 Expected: 3 paper rows (2 sharing one `concept_id`), 4 post rows across the 4 categories.
@@ -1697,7 +1704,7 @@ export default async function UploadVersionPage({ params }: { params: Promise<{ 
 
 - [ ] **Step 4: Manual verification**
 
-Run: `npm run dev`. Log in as `author1@ksca.dev`, go to `/papers/upload`, submit a small PDF — should redirect to `/papers/KSCA-...` (detail page doesn't exist until Task 11, a 404 there is expected for now; confirm instead via `npx supabase db psql -c "select concept_id, version_no from papers order by created_at desc limit 1;"`). Then visit the seeded paper's `/papers/<its concept_id>/upload-version` as its author and confirm a new `version_no` row is created; as a different user, confirm you're redirected away.
+Run: `npm run dev`. Log in as `author1@ksca.dev`, go to `/papers/upload`, submit a small PDF — should redirect to `/papers/KSCA-...` (detail page doesn't exist until Task 11, a 404 there is expected for now; confirm instead via `npx supabase db query --local "select concept_id, version_no from papers order by created_at desc limit 1;"`). Then visit the seeded paper's `/papers/<its concept_id>/upload-version` as its author and confirm a new `version_no` row is created; as a different user, confirm you're redirected away.
 
 - [ ] **Step 5: Commit**
 
@@ -2188,7 +2195,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
 - [ ] **Step 9: Manual verification**
 
-Run: `npm run dev`. Visit `/papers/<seeded multi-version concept_id>` — confirm both APA/BibTeX render and copy, version history lists v1/v2 with v2 shown as current, `/papers/<concept_id>/v/1` shows the old abstract, and the PDF download link resolves (redirects to a signed URL that serves the placeholder PDF from Task 3). **While logged out (or as a user who isn't that paper's author)**, reload the detail page a couple of times and confirm `view_count` actually increases (`npx supabase db psql -c "select view_count from papers where concept_id = '<concept_id>' order by version_no desc limit 1;"`) — this is the specific case `papers_update_own_or_admin` would silently block without the admin-client fix above.
+Run: `npm run dev`. Visit `/papers/<seeded multi-version concept_id>` — confirm both APA/BibTeX render and copy, version history lists v1/v2 with v2 shown as current, `/papers/<concept_id>/v/1` shows the old abstract, and the PDF download link resolves (redirects to a signed URL that serves the placeholder PDF from Task 3). **While logged out (or as a user who isn't that paper's author)**, reload the detail page a couple of times and confirm `view_count` actually increases (`npx supabase db query --local "select view_count from papers where concept_id = '<concept_id>' order by version_no desc limit 1;"`) — this is the specific case `papers_update_own_or_admin` would silently block without the admin-client fix above.
 
 - [ ] **Step 10: Commit**
 
@@ -2537,7 +2544,7 @@ Add the import: `import { ReportButton } from '@/components/ReportButton';`
 
 - [ ] **Step 7: Manual verification**
 
-Run: `npm run dev`. On a paper detail page, click 신고, submit with a reason — confirm a row appears via `npx supabase db psql -c "select * from reports order by created_at desc limit 1;"`.
+Run: `npm run dev`. On a paper detail page, click 신고, submit with a reason — confirm a row appears via `npx supabase db query --local "select * from reports order by created_at desc limit 1;"`.
 
 - [ ] **Step 8: Commit**
 
@@ -3347,7 +3354,7 @@ export default async function AdminReportsPage() {
 
 - [ ] **Step 6: Manual verification**
 
-Run: `npm run dev`. As three different logged-in users, report the same paper 3 times (reason: spam) to trip the auto-hide trigger from Task 2. Log in as `admin@ksca.dev`, visit `/admin/reports` — confirm the paper appears grouped with all 3 reports. Click 복구 — confirm the paper's `status` returns to `public` (check via the paper detail page or `supabase db psql`) and it disappears from the queue. Repeat and click 삭제 확정 instead — confirm it disappears from the queue but the paper stays `hidden`.
+Run: `npm run dev`. As three different logged-in users, report the same paper 3 times (reason: spam) to trip the auto-hide trigger from Task 2. Log in as `admin@ksca.dev`, visit `/admin/reports` — confirm the paper appears grouped with all 3 reports. Click 복구 — confirm the paper's `status` returns to `public` (check via the paper detail page or `npx supabase db query --local "select status from papers where id = '<paper id>';"`) and it disappears from the queue. Repeat and click 삭제 확정 instead — confirm it disappears from the queue but the paper stays `hidden`.
 
 - [ ] **Step 7: Commit**
 
@@ -3376,7 +3383,7 @@ RLS is the real security boundary for this app (Task 11's `canView` and Task 13/
 - [ ] **Step 1: Write `supabase/tests/rls_check.sql`**
 
 ```sql
--- Run with: npx supabase db psql -f supabase/tests/rls_check.sql
+-- Run with: npx supabase db query --local -f supabase/tests/rls_check.sql
 -- Exercises papers_select or paper visibility for anon / other-user / author / admin.
 -- Raises an exception (non-zero exit) on the first failed assertion.
 
@@ -3439,10 +3446,10 @@ end $$;
 - [ ] **Step 2: Run it**
 
 ```bash
-npx supabase db psql -f supabase/tests/rls_check.sql
+npx supabase db query --local -f supabase/tests/rls_check.sql
 ```
 
-Expected: `NOTICE: rls_check.sql: all assertions passed` and no `ERROR:` lines. If an assertion fails, the failing message names exactly which policy is wrong — fix the migration in Task 2, `npx supabase db reset`, and rerun this script before moving on.
+Expected: a clean exit (per the Environment note above, `raise notice` text won't print — no `_tag":"Error"` in the output is the pass signal). If an assertion fails, the error's `message` field names exactly which policy is wrong — fix the migration in Task 2, `npx supabase db reset`, and rerun this script before moving on.
 
 - [ ] **Step 3: Commit**
 
@@ -3470,7 +3477,7 @@ Claude-Session: https://claude.ai/code/session_01YAV7S1ikQANDFtMMDEXDWi"
 - [ ] **Step 1: Write `supabase/tests/report_threshold_check.sql`** — checks all four target types, and (unlike Task 2 Step 10's superuser smoke test) inserts the reports AS the reporting users under RLS, so it actually exercises the `security definer` fix from the pre-flight review. If that fix or migration 0006 ever regresses, this script — not Task 2 Step 10 — is what catches it.
 
 ```sql
--- Run with: npx supabase db psql -f supabase/tests/report_threshold_check.sql
+-- Run with: npx supabase db query --local -f supabase/tests/report_threshold_check.sql
 -- Reports are inserted AS each reporting user (authenticated role, RLS
 -- applied) rather than as the superuser — this is the realistic path a
 -- real report submission through the app takes.
@@ -3529,10 +3536,10 @@ end $$;
 - [ ] **Step 2: Run it**
 
 ```bash
-npx supabase db psql -f supabase/tests/report_threshold_check.sql
+npx supabase db query --local -f supabase/tests/report_threshold_check.sql
 ```
 
-Expected: `NOTICE: report_threshold_check.sql: all 4 target types passed under RLS`. If this fails with a permission/RLS error instead of the assertion message, the most likely cause is migration 0004's `security definer` on `check_report_threshold()` or migration 0006's two admin-only `update` policies — re-check both against Task 2 Steps 5 and 7 before assuming this script is wrong.
+Expected: a clean exit (per the Environment note above — no `NOTICE` text will print even on success; no `_tag":"Error"` in the output is the pass signal). If this fails with a permission/RLS error instead, the most likely cause is migration 0004's `security definer` on `check_report_threshold()` or migration 0006's two admin-only `update` policies — re-check both against Task 2 Steps 5 and 7 before assuming this script is wrong.
 
 - [ ] **Step 3: Firm up `components/EmptyState.tsx`**
 
@@ -3609,7 +3616,7 @@ npm install
 npx supabase start          # 로컬 Supabase 스택 기동 (Postgres/Auth/Storage/Studio)
 cp .env.local.example .env.local
 # .env.local에 `npx supabase status`의 API URL / anon key / service_role key 입력
-npx supabase db psql -c "insert into storage.buckets (id, name, public) values ('papers', 'papers', false) on conflict (id) do nothing;"
+npx supabase db query --local "insert into storage.buckets (id, name, public) values ('papers', 'papers', false) on conflict (id) do nothing;"
 npx supabase db reset        # 마이그레이션 + seed.sql 적용
 chmod +x supabase/seed-storage.sh && ./supabase/seed-storage.sh
 npm run dev
@@ -3625,8 +3632,8 @@ npm run dev
 
 ```bash
 npm test                                              # 단위 테스트 (Vitest)
-npx supabase db psql -f supabase/tests/rls_check.sql              # RLS 정책 검증
-npx supabase db psql -f supabase/tests/report_threshold_check.sql # 신고 임계값 트리거 검증
+npx supabase db query --local -f supabase/tests/rls_check.sql              # RLS 정책 검증
+npx supabase db query --local -f supabase/tests/report_threshold_check.sql # 신고 임계값 트리거 검증
 ```
 
 ### 스키마를 바꿀 때
@@ -3661,7 +3668,7 @@ npx supabase db psql -f supabase/tests/report_threshold_check.sql # 신고 임�
 - **PR 전 체크리스트**:
   1. `npm test` 통과
   2. `npm run build` 통과
-  3. 스키마를 건드렸다면 `npx supabase db psql -f supabase/tests/rls_check.sql`과 `report_threshold_check.sql` 통과
+  3. 스키마를 건드렸다면 `npx supabase db query --local -f supabase/tests/rls_check.sql`과 `report_threshold_check.sql` 통과
   4. 새 라우트를 추가했다면 익명/일반회원/운영진 3가지 권한으로 수동 확인
 - **PR 설명**: 무엇을, 왜 바꿨는지 + 확인한 방법(테스트 커맨드 또는 수동 확인 절차).
 - **리뷰**: 최소 1인 승인 후 병합. RLS 정책이나 마이그레이션을 건드리는 PR은 반드시 위 §12/§8 스키마와의 정합성을 리뷰어가 직접 확인한다.
