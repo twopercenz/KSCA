@@ -5,20 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { requireUser } from '@/lib/auth';
-
-const MAX_BYTES = 20 * 1024 * 1024;
-
-export function validateUploadRequest(input: { fileName: string; fileSize: number; fileType: string }):
-  | { ok: true }
-  | { ok: false; error: string } {
-  if (input.fileType !== 'application/pdf' && !input.fileName.toLowerCase().endsWith('.pdf')) {
-    return { ok: false, error: 'PDF 파일만 업로드할 수 있습니다.' };
-  }
-  if (input.fileSize > MAX_BYTES) {
-    return { ok: false, error: '파일 크기는 20MB를 초과할 수 없습니다.' };
-  }
-  return { ok: true };
-}
+import { validateUploadRequest } from './validate-upload';
 
 export async function requestPaperUpload(fileName: string, fileSize: number, fileType: string) {
   const supabase = await createClient();

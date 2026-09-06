@@ -1,6 +1,6 @@
 // lib/actions/papers.test.ts
 import { describe, it, expect } from 'vitest';
-import { validateUploadRequest } from './papers';
+import { validateUploadRequest } from './validate-upload';
 
 describe('validateUploadRequest', () => {
   it('accepts a PDF under 20MB', () => {
