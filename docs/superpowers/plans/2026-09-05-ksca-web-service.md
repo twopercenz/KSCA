@@ -700,11 +700,13 @@ done
 rm -f "$PDF_PATH"
 ```
 
-- [ ] **Step 3: Create the private `papers` bucket, then apply seed + storage upload**
+- [ ] **Step 3: Apply migrations + seed, then create the private `papers` bucket and run the storage upload**
+
+**Order matters:** `db reset` recreates the entire local Postgres instance (including the `storage` schema) from migrations — run it first, or a bucket row inserted beforehand is wiped out.
 
 ```bash
-npx supabase db query --local "insert into storage.buckets (id, name, public) values ('papers', 'papers', false) on conflict (id) do nothing;"
 npx supabase db reset
+npx supabase db query --local "insert into storage.buckets (id, name, public) values ('papers', 'papers', false) on conflict (id) do nothing;"
 chmod +x supabase/seed-storage.sh
 ./supabase/seed-storage.sh
 ```
@@ -3616,8 +3618,8 @@ npm install
 npx supabase start          # 로컬 Supabase 스택 기동 (Postgres/Auth/Storage/Studio)
 cp .env.local.example .env.local
 # .env.local에 `npx supabase status`의 API URL / anon key / service_role key 입력
+npx supabase db reset        # 마이그레이션 + seed.sql 적용 (db reset이 storage 스키마를 포함해 DB 전체를 재생성하므로 버킷 생성보다 먼저 실행)
 npx supabase db query --local "insert into storage.buckets (id, name, public) values ('papers', 'papers', false) on conflict (id) do nothing;"
-npx supabase db reset        # 마이그레이션 + seed.sql 적용
 chmod +x supabase/seed-storage.sh && ./supabase/seed-storage.sh
 npm run dev
 ```
