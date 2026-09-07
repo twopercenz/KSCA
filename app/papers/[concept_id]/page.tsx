@@ -6,6 +6,8 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { canView } from '@/lib/visibility';
 import { CitationBlock } from '@/components/CitationBlock';
 import { VersionBadge } from '@/components/VersionBadge';
+import { CommentThread } from '@/components/CommentThread';
+import { addPaperComment, getPaperComments } from '@/lib/actions/paper-comments';
 
 export default async function PaperDetailPage({ params }: { params: Promise<{ concept_id: string }> }) {
   const { concept_id } = await params;
@@ -75,6 +77,33 @@ export default async function PaperDetailPage({ params }: { params: Promise<{ co
           새 버전 업로드
         </Link>
       )}
+
+      <section>
+        <h2 className="mb-2 font-medium">댓글</h2>
+        <CommentThread
+          comments={(await getPaperComments(concept_id)).map((c: any) => ({
+            id: c.id,
+            content: c.content,
+            created_at: c.created_at,
+            authorNickname: c.profiles?.nickname ?? '알 수 없음',
+            version: c.written_at_version,
+          }))}
+        />
+        {user && (
+          <form
+            action={async (formData: FormData) => {
+              'use server';
+              await addPaperComment(latest.id, latest.version_no, String(formData.get('content') ?? ''));
+            }}
+            className="mt-3 space-y-2"
+          >
+            <textarea name="content" required rows={3} className="w-full rounded border p-2 text-sm" />
+            <button type="submit" className="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground">
+              댓글 작성
+            </button>
+          </form>
+        )}
+      </section>
     </div>
   );
 }
